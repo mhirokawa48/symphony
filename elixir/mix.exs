@@ -80,7 +80,7 @@ defmodule SymphonyElixir.MixProject do
       {:yaml_elixir, "~> 2.12"},
       {:solid, "~> 1.2"},
       {:ecto, "~> 3.13"},
-      {:burrito, "~> 1.5", only: :prod, runtime: false},
+      {:burrito, "~> 1.5.0", only: :prod, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]
