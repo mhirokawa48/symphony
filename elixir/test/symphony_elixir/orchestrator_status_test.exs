@@ -88,7 +88,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert {:ok, %{}} = BlockedStore.load()
   end
 
-  test "normal worker completion deletes its durable inflight claim" do
+  test "normal worker completion persists a durable block while issue remains active" do
     issue = durable_issue("issue-inflight-complete", "MAS-118")
     state = Orchestrator.claim_issue_before_dispatch_for_test(%Orchestrator.State{}, issue)
 
@@ -100,11 +100,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         %{identifier: issue.identifier, issue: issue}
       )
 
-    assert completed_state.durable_claims == %{}
-    assert Map.has_key?(completed_state.retry_attempts, issue.id)
-    assert {:ok, %{}} = BlockedStore.load()
+    refute Map.has_key?(completed_state.retry_attempts, issue.id)
+    assert completed_state.blocked[issue.id].status == :blocked
+    assert completed_state.durable_claims[issue.id].status == :blocked
 
-    Process.cancel_timer(completed_state.retry_attempts[issue.id].timer_ref)
+    assert {:ok, stored} = BlockedStore.load()
+    assert stored[issue.id].status == :blocked
+    assert stored[issue.id].error =~ "completed normally"
   end
 
   test "durable block survives updated_at changes until an explicit routing change" do
