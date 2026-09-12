@@ -10,7 +10,6 @@ defmodule SymphonyElixir.Orchestrator do
   alias SymphonyElixir.{AgentRunner, BlockedStore, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
-  @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -225,17 +224,12 @@ defmodule SymphonyElixir.Orchestrator do
     if input_required_blocker?(running_entry) do
       block_input_required_agent_down(state, issue_id, running_entry, session_id, :normal)
     else
-      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+      error =
+        "agent completed normally while issue remained active; automatic cross-worker continuation is disabled"
 
-      state
-      |> complete_issue(issue_id)
-      |> schedule_issue_retry(issue_id, 1, %{
-        identifier: running_entry.identifier,
-        issue_url: running_entry.issue.url,
-        delay_type: :continuation,
-        worker_host: Map.get(running_entry, :worker_host),
-        workspace_path: Map.get(running_entry, :workspace_path)
-      })
+      Logger.warning("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; blocking until tracker state or routing changes")
+
+      block_issue_from_entry(state, issue_id, running_entry, error)
     end
   end
 
@@ -1140,17 +1134,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
-  defp complete_issue(%State{} = state, issue_id) do
-    state = %{
-      state
-      | completed: MapSet.put(state.completed, issue_id),
-        durable_claims: Map.delete(state.durable_claims, issue_id),
-        retry_attempts: Map.delete(state.retry_attempts, issue_id)
-    }
-
-    persist_durable_claims(state)
-  end
-
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
@@ -1321,10 +1304,7 @@ defmodule SymphonyElixir.Orchestrator do
          worker_slots_available?(state, metadata[:worker_host]) do
       case refresh_issue_for_dispatch(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
-          worker_attempt =
-            if metadata[:delay_type] == :continuation,
-              do: nil,
-              else: metadata[:failure_attempt] || attempt
+          worker_attempt = metadata[:failure_attempt] || attempt
 
           {:noreply, do_dispatch_issue(state, refreshed_issue, worker_attempt, metadata[:worker_host])}
 
@@ -1387,12 +1367,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
-    if metadata[:delay_type] == :continuation and attempt == 1 do
-      @continuation_retry_delay_ms
-    else
-      failure_retry_delay(attempt)
-    end
+  defp retry_delay(attempt, _metadata) when is_integer(attempt) and attempt > 0 do
+    failure_retry_delay(attempt)
   end
 
   defp failure_retry_delay(attempt) do

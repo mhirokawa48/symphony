@@ -1013,7 +1013,7 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
-  test "normal continuation is scheduled without consuming the failure retry budget" do
+  test "normal completion blocks an active issue without cross-worker continuation" do
     issue_id = "issue-resume"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
@@ -1027,11 +1027,13 @@ defmodule SymphonyElixir.CoreTest do
 
     initial_state = :sys.get_state(pid)
 
+    issue = %Issue{id: issue_id, identifier: "MT-558", state: "In Progress"}
+
     running_entry = %{
       pid: self(),
       ref: ref,
       identifier: "MT-558",
-      issue: %Issue{id: issue_id, identifier: "MT-558", state: "In Progress"},
+      issue: issue,
       started_at: DateTime.utc_now()
     }
 
@@ -1047,13 +1049,12 @@ defmodule SymphonyElixir.CoreTest do
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
-    assert MapSet.member?(state.completed, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, delay_type: :continuation} =
-             state.retry_attempts[issue_id]
-
-    assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert %{status: :blocked, error: error} = state.blocked[issue_id]
+    assert error =~ "completed normally"
+    assert state.durable_claims[issue_id].status == :blocked
   end
 
   test "unknown worker exit is blocked fail-closed" do
