@@ -1019,7 +1019,7 @@ defmodule SymphonyElixir.CoreTest do
              AgentRunner.continue_with_issue_for_test(issue, fetcher)
   end
 
-  test "normal worker exit schedules active-state continuation retry" do
+  test "normal continuation is scheduled without consuming the failure retry budget" do
     issue_id = "issue-resume"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :ContinuationOrchestrator)
@@ -1054,12 +1054,15 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+
+    assert %{attempt: 1, due_at_ms: due_at_ms, delay_type: :continuation} =
+             state.retry_attempts[issue_id]
+
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
   end
 
-  test "abnormal worker exit increments retry attempt progressively" do
+  test "unknown worker exit is blocked fail-closed" do
     issue_id = "issue-crash"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :CrashRetryOrchestrator)
@@ -1093,13 +1096,12 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
-             state.retry_attempts[issue_id]
-
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert %{error: error} = state.blocked[issue_id]
+    assert error =~ ":boom"
   end
 
-  test "first abnormal worker exit waits before retrying" do
+  test "startup response timeout retries up to the configured limit" do
     issue_id = "issue-crash-initial"
     ref = make_ref()
     orchestrator_name = Module.concat(__MODULE__, :InitialCrashRetryOrchestrator)
@@ -1128,14 +1130,75 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
-    send(pid, {:DOWN, ref, :process, self(), :boom})
+    failure = %AgentRunner.Error{message: "startup failed", reason: {:codex_startup, :response_timeout}}
+    send(pid, {:DOWN, ref, :process, self(), {failure, []}})
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", failure_reason: {:codex_startup, :response_timeout}} =
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, 9_000, 10_500)
+  end
+
+  test "agent failures are blocked when non-retryable or retry budget is exhausted" do
+    issue = %Issue{id: "failure-classification", identifier: "MT-SAFE", state: "In Progress"}
+
+    for reason <- [
+          {:codex_turn, {:turn_cancelled, %{}}},
+          {:codex_turn, {:turn_failed, %{message: "failed"}}},
+          {:codex_turn, {:port_exit, 0}},
+          {:codex_turn, :turn_timeout},
+          {:codex_turn, :response_timeout},
+          {:workspace_hook_failed, :before_run, 1, "failed"},
+          {:configuration_error, :invalid}
+        ] do
+      entry = %{identifier: issue.identifier, issue: issue, retry_attempt: 0}
+      failure = %AgentRunner.Error{message: "failed", reason: reason}
+      state = %Orchestrator.State{claimed: MapSet.new([issue.id])}
+      updated = Orchestrator.handle_agent_down_for_test({failure, []}, state, issue.id, entry)
+
+      assert updated.retry_attempts == %{}
+      assert updated.blocked[issue.id].error =~ inspect(reason)
+    end
+
+    entry = %{identifier: issue.identifier, issue: issue, retry_attempt: 2}
+    failure = %AgentRunner.Error{message: "failed", reason: {:codex_startup, :response_timeout}}
+    updated = Orchestrator.handle_agent_down_for_test({failure, []}, %Orchestrator.State{}, issue.id, entry)
+
+    assert updated.retry_attempts == %{}
+    assert updated.blocked[issue.id].error =~ "retry_exhausted=true"
+    assert updated.blocked[issue.id].error =~ "retry_attempts_consumed=2"
+  end
+
+  test "task supervisor start failure blocks the issue without retrying" do
+    {:ok, task_supervisor} = Task.Supervisor.start_link(max_children: 0)
+
+    issue = %Issue{
+      id: "spawn-failure",
+      identifier: "MT-SPAWN",
+      title: "Spawn failure",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-SPAWN"
+    }
+
+    state = %Orchestrator.State{
+      task_supervisor: task_supervisor,
+      claimed: MapSet.new([issue.id]),
+      retry_attempts: %{issue.id => %{attempt: 1}}
+    }
+
+    updated = Orchestrator.spawn_issue_for_test(state, issue, 1, "worker-1")
+
+    refute Map.has_key?(updated.running, issue.id)
+    refute Map.has_key?(updated.retry_attempts, issue.id)
+
+    assert %{
+             identifier: "MT-SPAWN",
+             issue: ^issue,
+             worker_host: "worker-1",
+             error: "failed to spawn agent: :max_children"
+           } = updated.blocked[issue.id]
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -1765,9 +1828,13 @@ defmodule SymphonyElixir.CoreTest do
         state: "In Progress"
       }
 
-      assert_raise RuntimeError, ~r/workspace_prepare_failed/, fn ->
-        AgentRunner.run(issue, nil, worker_host: "worker-a")
-      end
+      error =
+        assert_raise AgentRunner.Error, ~r/workspace_prepare_failed/, fn ->
+          AgentRunner.run(issue, nil, worker_host: "worker-a")
+        end
+
+      assert error.reason ==
+               {:workspace_prepare_failed, "worker-a", 75, "worker-a prepare failed\n"}
 
       trace = File.read!(trace_file)
       assert trace =~ "worker-a bash -lc"

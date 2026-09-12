@@ -900,7 +900,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert next_poll_in_ms <= 50
   end
 
-  test "orchestrator restarts stalled workers with retry backoff" do
+  test "orchestrator blocks stalled workers fail-closed" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
       codex_stall_timeout_ms: 1_000
@@ -934,7 +934,8 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         id: issue_id,
         identifier: "MT-STALL",
         state: "In Progress",
-        url: "https://example.org/issues/MT-STALL"
+        url: "https://example.org/issues/MT-STALL",
+        dispatchable: true
       },
       session_id: "thread-stall-turn-stall",
       last_codex_message: nil,
@@ -958,18 +959,15 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute Process.alive?(worker_pid)
     refute Map.has_key?(state.running, issue_id)
 
-    assert %{
-             attempt: 1,
-             due_at_ms: due_at_ms,
-             identifier: "MT-STALL",
-             issue_url: "https://example.org/issues/MT-STALL",
-             error: "stalled for " <> _
-           } = state.retry_attempts[issue_id]
+    refute Map.has_key?(state.retry_attempts, issue_id)
 
-    assert is_integer(due_at_ms)
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-    assert remaining_ms >= 9_500
-    assert remaining_ms <= 10_500
+    assert %{
+             identifier: "MT-STALL",
+             issue: %Issue{id: ^issue_id},
+             error: "stalled for " <> error
+           } = state.blocked[issue_id]
+
+    assert error =~ "ms; reason=no codex activity"
   end
 
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do

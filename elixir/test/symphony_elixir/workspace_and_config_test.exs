@@ -1014,6 +1014,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
+    assert config.agent.max_retry_attempts == 2
     assert config.codex.command == "codex app-server"
 
     assert config.codex.approval_policy == %{
@@ -1096,6 +1097,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), max_concurrent_agents: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_concurrent_agents"
+
+    write_workflow_file!(Workflow.workflow_file_path(), max_retry_attempts: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_retry_attempts"
 
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
