@@ -78,6 +78,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </p>
         </section>
       <% else %>
+        <%= if @payload[:dispatch_halted_reason] do %>
+          <section class="error-card">
+            <h2 class="error-title">New dispatches halted</h2>
+            <p class="error-copy">
+              Durable blocked state could not be written: <%= @payload.dispatch_halted_reason %>
+            </p>
+          </section>
+        <% end %>
+
         <section class="metric-grid">
           <article class="metric-card">
             <p class="metric-label">Running</p>

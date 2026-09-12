@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, BlockedStore, Config, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Tracker.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -38,7 +38,9 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       blocked: %{},
+      durable_claims: %{},
       retry_attempts: %{},
+      dispatch_halted_reason: nil,
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -69,10 +71,24 @@ defmodule SymphonyElixir.Orchestrator do
           codex_rate_limits: nil
         }
 
-        run_terminal_workspace_cleanup()
-        state = schedule_tick(state, 0)
+        case BlockedStore.load() do
+          {:ok, blocked} ->
+            state = %{
+              state
+              | blocked: blocked,
+                durable_claims: blocked,
+                claimed: blocked |> Map.keys() |> MapSet.new()
+            }
 
-        {:ok, state}
+            run_terminal_workspace_cleanup()
+            state = schedule_tick(state, 0)
+
+            {:ok, state}
+
+          {:error, reason} ->
+            Logger.error("Unable to load durable blocked state; refusing to dispatch: #{inspect(reason)}")
+            {:stop, reason}
+        end
 
       {:error, reason} ->
         {:stop, reason}
@@ -278,7 +294,8 @@ defmodule SymphonyElixir.Orchestrator do
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
 
-    with :ok <- Config.validate!(),
+    with nil <- state.dispatch_halted_reason,
+         :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
       choose_issues(issues, state)
@@ -322,6 +339,10 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       false ->
+        state
+
+      reason when is_binary(reason) ->
+        Logger.error("Dispatch halted because durable blocked state is unavailable: #{reason}")
         state
     end
   end
@@ -376,6 +397,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec claim_issue_before_dispatch_for_test(term(), Issue.t()) :: term()
+  def claim_issue_before_dispatch_for_test(%State{} = state, %Issue{} = issue) do
+    claim_issue_before_dispatch(state, issue)
+  end
+
+  @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
@@ -389,6 +416,12 @@ defmodule SymphonyElixir.Orchestrator do
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec reconcile_blocked_issues_for_test(term()) :: term()
+  def reconcile_blocked_issues_for_test(%State{} = state) do
+    reconcile_blocked_issues(state)
   end
 
   @doc false
@@ -596,13 +629,13 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
         end
 
-        %{
+        state = %{
           state
           | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            blocked: Map.delete(state.blocked, issue_id),
             retry_attempts: Map.delete(state.retry_attempts, issue_id)
         }
+
+        release_issue_claim(state, issue_id)
 
       _ ->
         release_issue_claim(state, issue_id)
@@ -790,20 +823,28 @@ defmodule SymphonyElixir.Orchestrator do
       workspace_path: Map.get(running_entry, :workspace_path),
       session_id: running_entry_session_id(running_entry),
       error: error,
+      status: :blocked,
       blocked_at: DateTime.utc_now(),
+      issue_updated_at: blocked_issue_updated_at(running_entry),
       last_codex_message: Map.get(running_entry, :last_codex_message),
       last_codex_event: Map.get(running_entry, :last_codex_event),
       last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
     }
 
-    %{
+    updated_state = %{
       state
       | running: Map.delete(state.running, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
         claimed: MapSet.put(state.claimed, issue_id),
-        blocked: Map.put(state.blocked, issue_id, blocked_entry)
+        blocked: Map.put(state.blocked, issue_id, blocked_entry),
+        durable_claims: Map.put(state.durable_claims, issue_id, blocked_entry)
     }
+
+    persist_blocked_state(updated_state)
   end
+
+  defp blocked_issue_updated_at(%{issue: %Issue{updated_at: updated_at}}), do: updated_at
+  defp blocked_issue_updated_at(_running_entry), do: nil
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -842,11 +883,17 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
-         %State{running: running, claimed: claimed, blocked: blocked} = state,
+         %State{
+           running: running,
+           claimed: claimed,
+           blocked: blocked,
+           dispatch_halted_reason: dispatch_halted_reason
+         } = state,
          active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
+    is_nil(dispatch_halted_reason) and
+      candidate_issue?(issue, active_states, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
@@ -978,6 +1025,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    state = claim_issue_before_dispatch(state, issue)
+
+    if is_binary(state.dispatch_halted_reason) do
+      Logger.error("Unable to dispatch #{issue_context(issue)} because durable claim persistence failed")
+      state
+    else
+      start_claimed_issue(state, issue, attempt, recipient, worker_host)
+    end
+  end
+
+  defp start_claimed_issue(%State{} = state, issue, attempt, recipient, worker_host) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
          end) do
@@ -1034,6 +1092,34 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp claim_issue_before_dispatch(%State{} = state, %Issue{} = issue) do
+    claimed_at = DateTime.utc_now()
+
+    claim = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      issue: issue,
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      error: "durable inflight claim",
+      status: :inflight,
+      blocked_at: claimed_at,
+      issue_updated_at: issue.updated_at,
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    state = %{
+      state
+      | claimed: MapSet.put(state.claimed, issue.id),
+        durable_claims: Map.put(state.durable_claims, issue.id, claim)
+    }
+
+    persist_durable_claims(state)
+  end
+
   defp revalidate_issue_for_dispatch(%Issue{id: issue_id}, issue_fetcher, terminal_states)
        when is_binary(issue_id) and is_function(issue_fetcher, 1) do
     case issue_fetcher.([issue_id]) do
@@ -1055,11 +1141,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
   defp complete_issue(%State{} = state, issue_id) do
-    %{
+    state = %{
       state
       | completed: MapSet.put(state.completed, issue_id),
+        durable_claims: Map.delete(state.durable_claims, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
+
+    persist_durable_claims(state)
   end
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
@@ -1125,6 +1214,17 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         :missing
     end
+  end
+
+  defp handle_retry_issue(
+         %State{dispatch_halted_reason: reason} = state,
+         issue_id,
+         _attempt,
+         _metadata
+       )
+       when is_binary(reason) do
+    Logger.error("Dropping retry for issue_id=#{issue_id} because dispatch is halted: #{reason}")
+    {:noreply, state}
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
@@ -1263,12 +1363,28 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
-    %{
+    updated_state = %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
+        durable_claims: Map.delete(state.durable_claims, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
+
+    persist_durable_claims(updated_state)
+  end
+
+  defp persist_blocked_state(%State{} = state), do: persist_durable_claims(state)
+
+  defp persist_durable_claims(%State{} = state) do
+    case BlockedStore.persist(state.durable_claims) do
+      :ok ->
+        state
+
+      {:error, reason} ->
+        Logger.error("Unable to persist durable blocked state: #{inspect(reason)}")
+        %{state | dispatch_halted_reason: inspect(reason)}
+    end
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
@@ -1513,6 +1629,7 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       dispatch_halted_reason: state.dispatch_halted_reason,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
