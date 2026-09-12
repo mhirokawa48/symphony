@@ -348,7 +348,7 @@ defmodule SymphonyElixir.CoreTest do
     assert Process.alive?(runtime_pid)
   end
 
-  test "restarting the orchestrator does not overlap redispatched work" do
+  test "restarting the orchestrator restores inflight work as blocked without redispatch" do
     issue_suffix = System.unique_integer([:positive])
 
     test_root =
@@ -456,19 +456,13 @@ defmodule SymphonyElixir.CoreTest do
     assert is_map(GenServer.call(restarted_pid, :snapshot))
     refute Process.alive?(first_worker_pid)
 
-    second_worker_pid =
-      eventually_value(fn ->
-        children = Task.Supervisor.children(task_supervisor_name)
-        assert length(children) <= 1
+    Process.sleep(100)
+    assert Task.Supervisor.children(task_supervisor_name) == []
 
-        case children do
-          [pid] when pid != first_worker_pid -> pid
-          _ -> nil
-        end
-      end)
+    assert %{blocked: [%{issue_id: issue_id, error: "durable inflight claim"}]} =
+             GenServer.call(restarted_pid, :snapshot)
 
-    assert is_pid(second_worker_pid)
-    assert Process.alive?(second_worker_pid)
+    assert issue_id == issue.id
   end
 
   test "linear issue state reconciliation fetch with no running issues is a no-op" do

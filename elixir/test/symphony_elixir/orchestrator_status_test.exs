@@ -1,6 +1,312 @@
 defmodule SymphonyElixir.OrchestratorStatusTest do
   use SymphonyElixir.TestSupport
 
+  test "dispatch persists an inflight claim before a worker may start" do
+    issue = durable_issue("issue-inflight", "MAS-110")
+
+    state = Orchestrator.claim_issue_before_dispatch_for_test(%Orchestrator.State{}, issue)
+
+    assert state.dispatch_halted_reason == nil
+    assert state.durable_claims[issue.id].status == :inflight
+    assert {:ok, stored} = BlockedStore.load()
+    assert stored[issue.id].status == :inflight
+  end
+
+  test "dispatch does not start a worker when inflight claim persistence fails" do
+    issue = durable_issue("issue-claim-write-failure", "MAS-111")
+    workflow_path = Workflow.workflow_file_path()
+    missing_workflow = Path.join([Path.dirname(workflow_path), "missing", "WORKFLOW.md"])
+    Workflow.set_workflow_file_path(missing_workflow)
+
+    state = %Orchestrator.State{task_supervisor: :worker_must_not_start}
+    halted_state = Orchestrator.spawn_issue_for_test(state, issue, nil, nil)
+    Workflow.set_workflow_file_path(workflow_path)
+
+    assert halted_state.dispatch_halted_reason =~ "blocked_store_write_failed"
+    refute Map.has_key?(halted_state.running, issue.id)
+  end
+
+  test "failed blocked transition leaves inflight claim restart-safe" do
+    issue = durable_issue("issue-inflight-restart", "MAS-116")
+    inflight_state = Orchestrator.claim_issue_before_dispatch_for_test(%Orchestrator.State{}, issue)
+    assert {:ok, stored} = BlockedStore.load()
+    assert stored[issue.id].status == :inflight
+
+    workflow_path = Workflow.workflow_file_path()
+    missing_workflow = Path.join([Path.dirname(workflow_path), "missing", "WORKFLOW.md"])
+    Workflow.set_workflow_file_path(missing_workflow)
+
+    halted_state =
+      Orchestrator.handle_agent_down_for_test(
+        :nonretryable,
+        inflight_state,
+        issue.id,
+        %{identifier: issue.identifier, issue: issue}
+      )
+
+    assert halted_state.dispatch_halted_reason =~ "blocked_store_write_failed"
+    Workflow.set_workflow_file_path(workflow_path)
+    assert {:ok, stored} = BlockedStore.load()
+    assert stored[issue.id].status == :inflight
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    name = Module.concat(__MODULE__, :InflightRestartOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    Process.sleep(100)
+    restarted_state = :sys.get_state(pid)
+
+    assert restarted_state.blocked[issue.id].status == :inflight
+    refute Map.has_key?(restarted_state.running, issue.id)
+    refute Orchestrator.should_dispatch_issue_for_test(issue, restarted_state)
+  end
+
+  test "missing inflight claim is deleted after restart reconciliation" do
+    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
+    issue = durable_issue("issue-inflight-missing", "MAS-117")
+    _state = Orchestrator.claim_issue_before_dispatch_for_test(%Orchestrator.State{}, issue)
+    assert {:ok, stored} = BlockedStore.load()
+    assert stored[issue.id].status == :inflight
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
+    {:ok, restored} = BlockedStore.load()
+
+    restarted_state = %Orchestrator.State{
+      blocked: restored,
+      durable_claims: restored,
+      claimed: restored |> Map.keys() |> MapSet.new()
+    }
+
+    reconciled_state = Orchestrator.reconcile_blocked_issues_for_test(restarted_state)
+
+    assert reconciled_state.blocked == %{}
+    assert reconciled_state.durable_claims == %{}
+    assert {:ok, %{}} = BlockedStore.load()
+  end
+
+  test "normal worker completion deletes its durable inflight claim" do
+    issue = durable_issue("issue-inflight-complete", "MAS-118")
+    state = Orchestrator.claim_issue_before_dispatch_for_test(%Orchestrator.State{}, issue)
+
+    completed_state =
+      Orchestrator.handle_agent_down_for_test(
+        :normal,
+        state,
+        issue.id,
+        %{identifier: issue.identifier, issue: issue}
+      )
+
+    assert completed_state.durable_claims == %{}
+    assert Map.has_key?(completed_state.retry_attempts, issue.id)
+    assert {:ok, %{}} = BlockedStore.load()
+
+    Process.cancel_timer(completed_state.retry_attempts[issue.id].timer_ref)
+  end
+
+  test "durable block survives updated_at changes until an explicit routing change" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_required_labels: ["symphony"]
+    )
+
+    updated_at = ~U[2026-09-12 01:00:00Z]
+
+    issue = %Issue{
+      id: "issue-durable-restart",
+      identifier: "MAS-112",
+      title: "Durable restart safety",
+      state: "In Progress",
+      dispatchable: true,
+      labels: ["symphony"],
+      updated_at: updated_at
+    }
+
+    blocked_state =
+      Orchestrator.handle_agent_down_for_test(
+        :nonretryable,
+        %Orchestrator.State{
+          running: %{"issue-durable-restart" => %{identifier: "MAS-112", issue: issue}},
+          claimed: MapSet.new(["issue-durable-restart"])
+        },
+        issue.id,
+        %{identifier: issue.identifier, issue: issue}
+      )
+
+    assert File.exists?(BlockedStore.path())
+    assert Map.has_key?(blocked_state.blocked, issue.id)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    name = Module.concat(__MODULE__, :DurableRestartOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    Process.sleep(100)
+    restarted_state = :sys.get_state(pid)
+
+    assert Map.has_key?(restarted_state.blocked, issue.id)
+    refute Map.has_key?(restarted_state.running, issue.id)
+    refute Orchestrator.should_dispatch_issue_for_test(issue, restarted_state)
+
+    changed_issue = %{issue | updated_at: DateTime.add(updated_at, 1, :second)}
+
+    still_blocked_state =
+      Orchestrator.reconcile_blocked_issue_states_for_test([changed_issue], restarted_state)
+
+    assert Map.has_key?(still_blocked_state.blocked, issue.id)
+    refute Orchestrator.should_dispatch_issue_for_test(changed_issue, still_blocked_state)
+    assert {:ok, %{"issue-durable-restart" => _}} = BlockedStore.load()
+
+    non_routable_issue = %{changed_issue | labels: []}
+
+    released_state =
+      Orchestrator.reconcile_blocked_issue_states_for_test([non_routable_issue], still_blocked_state)
+
+    refute Map.has_key?(released_state.blocked, issue.id)
+    assert {:ok, %{}} = BlockedStore.load()
+
+    rerouted_issue = %{non_routable_issue | labels: ["symphony"]}
+    assert Orchestrator.should_dispatch_issue_for_test(rerouted_issue, released_state)
+  end
+
+  test "terminal and non-routable durable blocks are deleted" do
+    issue = %Issue{
+      id: "issue-durable-terminal",
+      identifier: "MAS-113",
+      title: "Release durable state",
+      state: "In Progress",
+      dispatchable: true,
+      updated_at: ~U[2026-09-12 02:00:00Z]
+    }
+
+    inflight_state = Orchestrator.claim_issue_before_dispatch_for_test(%Orchestrator.State{}, issue)
+    state = %{inflight_state | blocked: inflight_state.durable_claims}
+    terminal_issue = %{issue | state: "Done"}
+    released_state = Orchestrator.reconcile_blocked_issue_states_for_test([terminal_issue], state)
+
+    refute Map.has_key?(released_state.blocked, issue.id)
+    assert {:ok, %{}} = BlockedStore.load()
+
+    state = durable_block_state(issue)
+    non_routable_issue = %{issue | dispatchable: false}
+    released_state = Orchestrator.reconcile_blocked_issue_states_for_test([non_routable_issue], state)
+
+    refute Map.has_key?(released_state.blocked, issue.id)
+    assert {:ok, %{}} = BlockedStore.load()
+  end
+
+  test "durable blocked stores are isolated by workflow directory" do
+    first_workflow = Workflow.workflow_file_path()
+    first_issue = %Issue{id: "lab-1", identifier: "LAB-1", updated_at: ~U[2026-09-12 03:00:00Z]}
+    _state = durable_block_state(first_issue)
+    first_store = BlockedStore.path()
+
+    second_dir = Path.join(System.tmp_dir!(), "symphony-x-#{System.unique_integer([:positive])}")
+    second_workflow = Path.join(second_dir, "WORKFLOW.md")
+    File.mkdir_p!(second_dir)
+    write_workflow_file!(second_workflow, tracker_kind: "memory")
+    Workflow.set_workflow_file_path(second_workflow)
+    second_issue = %Issue{id: "x-1", identifier: "X-1", updated_at: ~U[2026-09-12 04:00:00Z]}
+    _state = durable_block_state(second_issue)
+
+    assert BlockedStore.path() != first_store
+    assert {:ok, %{"x-1" => _}} = BlockedStore.load()
+
+    Workflow.set_workflow_file_path(first_workflow)
+    assert {:ok, %{"lab-1" => _}} = BlockedStore.load()
+
+    File.rm_rf!(second_dir)
+  end
+
+  test "corrupt durable blocked state prevents orchestrator startup" do
+    File.write!(BlockedStore.path(), "{not-json")
+    name = Module.concat(__MODULE__, :CorruptBlockedStoreOrchestrator)
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    assert {:error, {:invalid_blocked_store, path}} = Orchestrator.start_link(name: name)
+    Process.flag(:trap_exit, previous_trap_exit)
+    assert path == BlockedStore.path()
+    refute Process.whereis(name)
+  end
+
+  test "durable store write failure halts dispatch and is observable" do
+    issue = %Issue{
+      id: "issue-write-failure",
+      identifier: "MAS-114",
+      title: "Fail closed on durable write",
+      state: "In Progress",
+      dispatchable: true,
+      updated_at: ~U[2026-09-12 05:00:00Z]
+    }
+
+    workflow_path = Workflow.workflow_file_path()
+    missing_workflow = Path.join([Path.dirname(workflow_path), "missing", "WORKFLOW.md"])
+    Workflow.set_workflow_file_path(missing_workflow)
+    halted_state = durable_block_state(issue)
+    Workflow.set_workflow_file_path(workflow_path)
+
+    assert is_binary(halted_state.dispatch_halted_reason)
+    assert halted_state.dispatch_halted_reason =~ "blocked_store_write_failed"
+
+    candidate = %{
+      issue
+      | id: "issue-after-write-failure",
+        identifier: "MAS-115",
+        title: "Must not dispatch"
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(candidate, halted_state)
+
+    name = Module.concat(__MODULE__, :HaltedDispatchOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: name)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: GenServer.stop(pid)
+    end)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | dispatch_halted_reason: halted_state.dispatch_halted_reason}
+    end)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [candidate])
+    send(pid, :tick)
+    Process.sleep(100)
+
+    refute Map.has_key?(:sys.get_state(pid).running, candidate.id)
+
+    assert %{dispatch_halted_reason: reason} = Orchestrator.snapshot(name, 1_000)
+    assert reason == halted_state.dispatch_halted_reason
+
+    assert %{dispatch_halted_reason: ^reason} =
+             SymphonyElixirWeb.Presenter.state_payload(name, 1_000)
+  end
+
+  defp durable_block_state(issue) do
+    Orchestrator.handle_agent_down_for_test(
+      :nonretryable,
+      %Orchestrator.State{running: %{issue.id => %{identifier: issue.identifier, issue: issue}}},
+      issue.id,
+      %{identifier: issue.identifier, issue: issue}
+    )
+  end
+
+  defp durable_issue(id, identifier) do
+    %Issue{
+      id: id,
+      identifier: identifier,
+      title: "Durable claim test",
+      state: "In Progress",
+      dispatchable: true,
+      updated_at: ~U[2026-09-12 06:00:00Z]
+    }
+  end
+
   test "snapshot returns :timeout when snapshot server is unresponsive" do
     server_name = Module.concat(__MODULE__, :UnresponsiveSnapshotServer)
     parent = self()

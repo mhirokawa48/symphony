@@ -32,8 +32,13 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
 issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
-entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
-tracker issue can become a dispatch candidate again after restart.
+entries are also persisted in `.symphony-blocked.json` next to the active `WORKFLOW.md`, so they
+remain blocked across orchestrator restarts. Terminal, non-routable, and missing issues are removed
+from the durable store; an ordinary issue update does not release a block. Invalid durable state
+prevents startup, and a durable-state write failure halts subsequent new dispatches while leaving
+existing workers running. Before worker startup, Symphony writes an `inflight` durable claim; a
+restart restores both `inflight` and `blocked` entries as non-dispatchable. The halt reason is
+exposed by the dashboard and JSON state API.
 
 ## How to use it
 

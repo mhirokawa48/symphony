@@ -7,6 +7,7 @@ defmodule SymphonyElixir.TestSupport do
       import ExUnit.CaptureLog
 
       alias SymphonyElixir.AgentRunner
+      alias SymphonyElixir.BlockedStore
       alias SymphonyElixir.CLI
       alias SymphonyElixir.Codex.AppServer
       alias SymphonyElixir.Config
