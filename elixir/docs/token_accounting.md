@@ -302,3 +302,26 @@ If Symphony documents token reporting externally, the contract should be:
 - Key totals by `thread_id`
 - Do not classify generic `usage` by field name alone
 - Do not double-count turn-completed usage after live updates
+
+## Hard Thread Token Budget
+
+Symphony supports an optional fail-closed cumulative token budget:
+
+```yaml
+codex:
+  max_thread_total_tokens: 150000
+```
+
+Semantics:
+
+- The guard uses only `thread/tokenUsage/updated.tokenUsage.total.totalTokens`.
+- The value is an absolute cumulative thread total; `last` is never added.
+- Generic `usage` payloads and turn-completed usage are not used for enforcement.
+- When the configured positive limit is reached or exceeded, the active turn returns
+  `{:token_budget_exceeded, total_tokens, limit}` and the app-server session is closed.
+- The failure is not retryable by the orchestrator; the issue enters the existing fail-closed
+  blocked path.
+- `null` or an omitted setting keeps the upstream-compatible no-budget behavior.
+
+This guard is intentionally independent from `agent.max_turns`. `max_turns` limits Symphony
+continuation turns; it does not bound model interactions inside one Codex turn.

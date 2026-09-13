@@ -165,6 +165,101 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "thread token budget fails closed on cumulative usage and stays compatible when disabled" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-token-budget-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-BUDGET")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      issue = %Issue{
+        id: "issue-token-budget",
+        identifier: "MT-BUDGET",
+        title: "Token budget",
+        description: "Enforce cumulative Codex thread budget",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-BUDGET",
+        labels: ["backend"]
+      }
+
+      write_fake = fn total_tokens, delayed_completion ->
+        completion =
+          if delayed_completion do
+            "sleep 1; printf '%s\\n' '{\"method\":\"turn/completed\"}'"
+          else
+            "printf '%s\\n' '{\"method\":\"turn/completed\"}'"
+          end
+
+        File.write!(
+          codex_binary,
+          """
+          #!/bin/sh
+          count=0
+          while IFS= read -r _line; do
+            count=$((count + 1))
+            case "$count" in
+              1) printf '%s\\n' '{"id":1,"result":{}}' ;;
+              2) ;;
+              3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-budget"}}}' ;;
+              4)
+                printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-budget"}}}'
+                printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-budget","turnId":"turn-budget","tokenUsage":{"total":{"inputTokens":#{total_tokens},"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":#{total_tokens}},"last":{"inputTokens":1,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":1},"modelContextWindow":200000}}}'
+                #{completion}
+                exit 0
+                ;;
+              *) exit 0 ;;
+            esac
+          done
+          """
+        )
+
+        File.chmod!(codex_binary, 0o755)
+      end
+
+      write_fake.(900, false)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_max_thread_total_tokens: 1_000
+      )
+
+      assert {:ok, _result} = AppServer.run(workspace, "under budget", issue)
+
+      write_fake.(1_250, true)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_max_thread_total_tokens: 1_000
+      )
+
+      started_at = System.monotonic_time(:millisecond)
+
+      assert {:error, {:token_budget_exceeded, 1_250, 1_000}} =
+               AppServer.run(workspace, "over budget", issue)
+
+      assert System.monotonic_time(:millisecond) - started_at < 900
+
+      write_fake.(5_000, false)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      assert {:ok, _result} = AppServer.run(workspace, "budget disabled", issue)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server passes explicit turn sandbox policies through unchanged" do
     test_root =
       Path.join(

@@ -535,6 +535,18 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:error, {:approval_required, payload}}
 
+      {:token_budget_exceeded, reason} ->
+        Logger.warning("Codex thread token budget exceeded: #{inspect(reason)}")
+
+        emit_message(
+          on_message,
+          :token_budget_exceeded,
+          %{payload: payload, raw: payload_string, reason: reason},
+          metadata
+        )
+
+        {:error, reason}
+
       :unhandled ->
         if needs_input?(method, payload) do
           emit_message(
@@ -559,6 +571,25 @@ defmodule SymphonyElixir.Codex.AppServer do
           Logger.debug("Codex notification: #{inspect(method)}")
           receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
         end
+    end
+  end
+
+  defp maybe_handle_approval_request(
+         _port,
+         "thread/tokenUsage/updated",
+         payload,
+         _payload_string,
+         _on_message,
+         _metadata,
+         _tool_executor,
+         _auto_approve_requests
+       ) do
+    case thread_token_budget(payload) do
+      {:exceeded, total_tokens, limit} ->
+        {:token_budget_exceeded, {:token_budget_exceeded, total_tokens, limit}}
+
+      :ok ->
+        :unhandled
     end
   end
 
@@ -719,6 +750,35 @@ defmodule SymphonyElixir.Codex.AppServer do
        ) do
     :unhandled
   end
+
+  defp thread_token_budget(payload) do
+    limit = Config.settings!().codex.max_thread_total_tokens
+    total_tokens = thread_total_tokens(payload)
+
+    cond do
+      is_integer(limit) and limit > 0 and is_integer(total_tokens) and total_tokens >= limit ->
+        {:exceeded, total_tokens, limit}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp thread_total_tokens(%{
+         "params" => %{
+           "tokenUsage" => %{
+             "total" => total
+           }
+         }
+       })
+       when is_map(total) do
+    case Map.get(total, "totalTokens") || Map.get(total, "total_tokens") do
+      value when is_integer(value) and value >= 0 -> value
+      _ -> nil
+    end
+  end
+
+  defp thread_total_tokens(_payload), do: nil
 
   defp normalize_dynamic_tool_result(%{"success" => success} = result) when is_boolean(success) do
     output =
