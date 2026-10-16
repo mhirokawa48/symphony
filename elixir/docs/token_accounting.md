@@ -305,7 +305,7 @@ If Symphony documents token reporting externally, the contract should be:
 
 ## Hard Thread Token Budget
 
-Symphony supports an optional fail-closed cumulative token budget:
+Symphony supports an optional fail-closed cumulative effective token budget:
 
 ```yaml
 codex:
@@ -314,11 +314,20 @@ codex:
 
 Semantics:
 
-- The guard uses only `thread/tokenUsage/updated.tokenUsage.total.totalTokens`.
-- The value is an absolute cumulative thread total; `last` is never added.
+- The guard uses `thread/tokenUsage/updated.tokenUsage.total` and computes
+  `effective_tokens = totalTokens - cachedInputTokens`.
+- `cachedInputTokens` is already included in `totalTokens`, so subtracting it prevents reused
+  context from consuming the hard budget again. For example, `177868` raw tokens with `132480`
+  cached input consumes `45388` effective tokens.
+- The values are absolute cumulative thread totals; `last` is never added.
+- A missing, negative, or inconsistent cached-input value is normalized to zero so malformed or
+  older payloads cannot bypass the budget. Snake-case token fields are also accepted.
+- If `totalTokens` is absent, compatible payloads can derive the raw total from non-negative
+  `inputTokens + outputTokens`. Reasoning output is already included in `outputTokens` and is not
+  added again.
 - Generic `usage` payloads and turn-completed usage are not used for enforcement.
 - When the configured positive limit is reached or exceeded, the active turn returns
-  `{:token_budget_exceeded, total_tokens, limit}` and the app-server session is closed.
+  `{:token_budget_exceeded, effective_tokens, limit}` and the app-server session is closed.
 - The failure is not retryable by the orchestrator; the issue enters the existing fail-closed
   blocked path.
 - `null` or an omitted setting keeps the upstream-compatible no-budget behavior.
