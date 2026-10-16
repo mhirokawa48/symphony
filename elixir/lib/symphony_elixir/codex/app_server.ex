@@ -753,18 +753,17 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp thread_token_budget(payload) do
     limit = Config.settings!().codex.max_thread_total_tokens
-    total_tokens = thread_total_tokens(payload)
+    effective_tokens = thread_effective_total_tokens(payload)
 
-    cond do
-      is_integer(limit) and limit > 0 and is_integer(total_tokens) and total_tokens >= limit ->
-        {:exceeded, total_tokens, limit}
-
-      true ->
-        :ok
+    if is_integer(limit) and limit > 0 and is_integer(effective_tokens) and
+         effective_tokens >= limit do
+      {:exceeded, effective_tokens, limit}
+    else
+      :ok
     end
   end
 
-  defp thread_total_tokens(%{
+  defp thread_effective_total_tokens(%{
          "params" => %{
            "tokenUsage" => %{
              "total" => total
@@ -772,13 +771,47 @@ defmodule SymphonyElixir.Codex.AppServer do
          }
        })
        when is_map(total) do
-    case Map.get(total, "totalTokens") || Map.get(total, "total_tokens") do
+    case raw_total_tokens(total) do
+      raw_tokens when is_integer(raw_tokens) ->
+        raw_tokens - cached_input_tokens(total, raw_tokens)
+
+      nil ->
+        nil
+    end
+  end
+
+  defp thread_effective_total_tokens(_payload), do: nil
+
+  defp raw_total_tokens(total) do
+    token_count(total, "totalTokens", "total_tokens") ||
+      with input_tokens when is_integer(input_tokens) <-
+             token_count(total, "inputTokens", "input_tokens"),
+           output_tokens when is_integer(output_tokens) <-
+             token_count(total, "outputTokens", "output_tokens") do
+        input_tokens + output_tokens
+      else
+        _ -> nil
+      end
+  end
+
+  defp cached_input_tokens(total, raw_tokens) do
+    cached_tokens = token_count(total, "cachedInputTokens", "cached_input_tokens")
+    input_tokens = token_count(total, "inputTokens", "input_tokens")
+
+    cond do
+      not is_integer(cached_tokens) -> 0
+      cached_tokens > raw_tokens -> 0
+      is_integer(input_tokens) and cached_tokens > input_tokens -> 0
+      true -> cached_tokens
+    end
+  end
+
+  defp token_count(usage, camel_key, snake_key) do
+    case Map.get(usage, camel_key) || Map.get(usage, snake_key) do
       value when is_integer(value) and value >= 0 -> value
       _ -> nil
     end
   end
-
-  defp thread_total_tokens(_payload), do: nil
 
   defp normalize_dynamic_tool_result(%{"success" => success} = result) when is_boolean(success) do
     output =

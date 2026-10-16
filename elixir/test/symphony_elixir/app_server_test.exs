@@ -165,7 +165,7 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "thread token budget fails closed on cumulative usage and stays compatible when disabled" do
+  test "thread token budget excludes cached input and stays compatible with older payloads" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -188,13 +188,33 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      write_fake = fn total_tokens, delayed_completion ->
+      write_fake = fn total_usage, delayed_completion ->
         completion =
           if delayed_completion do
             "sleep 1; printf '%s\\n' '{\"method\":\"turn/completed\"}'"
           else
             "printf '%s\\n' '{\"method\":\"turn/completed\"}'"
           end
+
+        usage_event =
+          Jason.encode!(%{
+            "method" => "thread/tokenUsage/updated",
+            "params" => %{
+              "threadId" => "thread-budget",
+              "turnId" => "turn-budget",
+              "tokenUsage" => %{
+                "total" => total_usage,
+                "last" => %{
+                  "inputTokens" => 1,
+                  "cachedInputTokens" => 0,
+                  "outputTokens" => 0,
+                  "reasoningOutputTokens" => 0,
+                  "totalTokens" => 1
+                },
+                "modelContextWindow" => 200_000
+              }
+            }
+          })
 
         File.write!(
           codex_binary,
@@ -209,7 +229,7 @@ defmodule SymphonyElixir.AppServerTest do
               3) printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-budget"}}}' ;;
               4)
                 printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-budget"}}}'
-                printf '%s\\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-budget","turnId":"turn-budget","tokenUsage":{"total":{"inputTokens":#{total_tokens},"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":#{total_tokens}},"last":{"inputTokens":1,"cachedInputTokens":0,"outputTokens":0,"reasoningOutputTokens":0,"totalTokens":1},"modelContextWindow":200000}}}'
+                printf '%s\\n' '#{usage_event}'
                 #{completion}
                 exit 0
                 ;;
@@ -222,17 +242,35 @@ defmodule SymphonyElixir.AppServerTest do
         File.chmod!(codex_binary, 0o755)
       end
 
-      write_fake.(900, false)
+      write_fake.(
+        %{
+          "inputTokens" => 176_836,
+          "cachedInputTokens" => 132_480,
+          "outputTokens" => 1_032,
+          "reasoningOutputTokens" => 0,
+          "totalTokens" => 177_868
+        },
+        false
+      )
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         codex_command: "#{codex_binary} app-server",
-        codex_max_thread_total_tokens: 1_000
+        codex_max_thread_total_tokens: 150_000
       )
 
-      assert {:ok, _result} = AppServer.run(workspace, "under budget", issue)
+      assert {:ok, _result} = AppServer.run(workspace, "cached input under budget", issue)
 
-      write_fake.(1_250, true)
+      write_fake.(
+        %{
+          "inputTokens" => 1_400,
+          "cachedInputTokens" => 400,
+          "outputTokens" => 100,
+          "reasoningOutputTokens" => 25,
+          "totalTokens" => 1_500
+        },
+        true
+      )
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
@@ -242,12 +280,51 @@ defmodule SymphonyElixir.AppServerTest do
 
       started_at = System.monotonic_time(:millisecond)
 
-      assert {:error, {:token_budget_exceeded, 1_250, 1_000}} =
-               AppServer.run(workspace, "over budget", issue)
+      assert {:error, {:token_budget_exceeded, 1_100, 1_000}} =
+               AppServer.run(workspace, "effective budget exceeded", issue)
 
       assert System.monotonic_time(:millisecond) - started_at < 900
 
-      write_fake.(5_000, false)
+      write_fake.(
+        %{
+          "inputTokens" => 1_250,
+          "cachedInputTokens" => 0,
+          "outputTokens" => 0,
+          "reasoningOutputTokens" => 0,
+          "totalTokens" => 1_250
+        },
+        true
+      )
+
+      assert {:error, {:token_budget_exceeded, 1_250, 1_000}} =
+               AppServer.run(workspace, "zero cached input", issue)
+
+      write_fake.(
+        %{
+          "input_tokens" => 1_250,
+          "output_tokens" => 0,
+          "reasoning_output_tokens" => 0
+        },
+        true
+      )
+
+      assert {:error, {:token_budget_exceeded, 1_250, 1_000}} =
+               AppServer.run(workspace, "compatible usage payload", issue)
+
+      write_fake.(
+        %{
+          "inputTokens" => 1_250,
+          "cachedInputTokens" => -100,
+          "outputTokens" => 0,
+          "totalTokens" => 1_250
+        },
+        true
+      )
+
+      assert {:error, {:token_budget_exceeded, 1_250, 1_000}} =
+               AppServer.run(workspace, "invalid cached input", issue)
+
+      write_fake.(%{"totalTokens" => 5_000}, false)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
